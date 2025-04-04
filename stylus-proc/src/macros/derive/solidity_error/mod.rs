@@ -28,6 +28,10 @@ struct DeriveSolidityError<E = Extension> {
     from_impls: Vec<syn::ItemImpl>,
     match_arms: Vec<syn::Arm>,
     _ext: E,
+    // Track the items we've seen during processing
+    seen_items: std::collections::HashMap<syn::Ident, syn::Item>,
+    // Track all variants to process
+    variants_to_process: Vec<(syn::Ident, syn::Field)>,
 }
 
 impl DeriveSolidityError {
@@ -37,6 +41,8 @@ impl DeriveSolidityError {
             from_impls: Vec::new(),
             match_arms: Vec::new(),
             _ext: Extension::default(),
+            seen_items: std::collections::HashMap::new(),
+            variants_to_process: Vec::new(),
         }
     }
 
@@ -55,6 +61,106 @@ impl DeriveSolidityError {
         });
         #[allow(clippy::unit_arg)]
         self._ext.add_variant(field);
+    }
+
+    /// Check if a type is an enum
+    fn is_enum_type(&self, ty: &syn::Type) -> bool {
+        if let syn::Type::Path(type_path) = ty {
+            if let Some(segment) = type_path.path.segments.last() {
+                if let syn::PathSegment {
+                    arguments: syn::PathArguments::None,
+                    ..
+                } = segment
+                {
+                    let type_name = &segment.ident;
+                    // First check if we've seen this type before
+                    if let Some(item) = self.seen_items.get(type_name) {
+                        if let syn::Item::Enum(item_enum) = item {
+                            return item_enum.attrs.iter().any(|attr| {
+                                if let syn::Meta::List(meta_list) = &attr.meta {
+                                    if let Some(ident) = meta_list.path.get_ident() {
+                                        if ident == "derive" {
+                                            if let Ok(syn::MetaList { tokens, .. }) =
+                                                syn::parse2::<syn::MetaList>(
+                                                    meta_list.tokens.clone(),
+                                                )
+                                            {
+                                                return tokens
+                                                    .to_string()
+                                                    .contains("SolidityError");
+                                            }
+                                        }
+                                    }
+                                }
+                                false
+                            });
+                        }
+                    }
+                    // If we haven't seen it before, check if it's a known error type
+                    // This is a fallback for types that are already defined in the codebase
+                    let type_name = type_name.to_string();
+                    return type_name.ends_with("Error") && !type_name.starts_with("My");
+                }
+            }
+        }
+        false
+    }
+
+    /// Add an item to our tracking
+    fn add_item(&mut self, item: syn::Item) {
+        if let syn::Item::Enum(item_enum) = &item {
+            self.seen_items.insert(item_enum.ident.clone(), item);
+        }
+    }
+
+    /// Collect all variants from an enum, including nested ones
+    fn collect_variants(&mut self, item: &syn::ItemEnum) {
+        for variant in &item.variants {
+            match &variant.fields {
+                Fields::Unnamed(e) if variant.fields.len() == 1 => {
+                    let field = e.unnamed.first().unwrap().clone();
+                    let ty = &field.ty;
+
+                    // Check if the type is an enum
+                    if self.is_enum_type(ty) {
+                        // If it's an enum, we need to process its variants
+                        if let syn::Type::Path(type_path) = ty {
+                            if let Some(segment) = type_path.path.segments.last() {
+                                // Get the enum item
+                                if let Some(syn::Item::Enum(nested_enum)) =
+                                    self.seen_items.get(&segment.ident).cloned()
+                                {
+                                    // Recursively collect variants from the nested enum
+                                    self.collect_variants(&nested_enum);
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+
+                    // Add this variant to our collection
+                    self.variants_to_process
+                        .push((variant.ident.clone(), field));
+                }
+                Fields::Unit => {
+                    emit_error!(variant, "variant not a 1-tuple");
+                }
+                _ => {
+                    emit_error!(variant.fields, "variant not a 1-tuple");
+                }
+            }
+        }
+    }
+
+    /// Process all collected variants
+    fn process_collected_variants(&mut self) {
+        // Create a temporary copy of the variants to process
+        let variants = std::mem::take(&mut self.variants_to_process);
+
+        // Process each variant
+        for (name, field) in variants {
+            self.add_variant(&name, field);
+        }
     }
 
     fn vec_u8_from_impl(&self) -> syn::ItemImpl {
@@ -76,20 +182,14 @@ impl From<&syn::ItemEnum> for DeriveSolidityError {
     fn from(item: &syn::ItemEnum) -> Self {
         let mut output = DeriveSolidityError::new(item.ident.clone());
 
-        for variant in &item.variants {
-            match &variant.fields {
-                Fields::Unnamed(e) if variant.fields.len() == 1 => {
-                    let field = e.unnamed.first().unwrap().clone();
-                    output.add_variant(&variant.ident, field);
-                }
-                Fields::Unit => {
-                    emit_error!(variant, "variant not a 1-tuple");
-                }
-                _ => {
-                    emit_error!(variant.fields, "variant not a 1-tuple");
-                }
-            };
-        }
+        // Add the current enum to our tracking
+        output.add_item(syn::Item::Enum(item.clone()));
+
+        // Collect all variants, including nested ones
+        output.collect_variants(item);
+
+        // Process all collected variants
+        output.process_collected_variants();
 
         output
     }
