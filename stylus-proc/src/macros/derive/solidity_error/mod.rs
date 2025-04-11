@@ -70,6 +70,17 @@ impl DeriveSolidityError {
             }
         }
     }
+
+    fn method_error_impl(&self) -> syn::ItemImpl {
+        let name = &self.name;
+        parse_quote! {
+            impl stylus_sdk::call::MethodError for #name {
+                fn encode(self) -> alloc::vec::Vec<u8> {
+                    self.into()
+                }
+            }
+        }
+    }
 }
 
 impl From<&syn::ItemEnum> for DeriveSolidityError {
@@ -101,6 +112,7 @@ impl ToTokens for DeriveSolidityError {
             from_impl.to_tokens(tokens);
         }
         self.vec_u8_from_impl().to_tokens(tokens);
+        self.method_error_impl().to_tokens(tokens);
         Extension::codegen(self).to_tokens(tokens);
     }
 }
